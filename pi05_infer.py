@@ -3,6 +3,7 @@ import triton
 import triton.language as tl
 import numpy as np
 import torch.nn as nn
+from contextlib import contextmanager
 from transformers import AutoTokenizer
 from pi0_infer import (
     vision_encoder,
@@ -523,9 +524,29 @@ def transformer_decoder(weights, buffers, encoder_seq_len, num_steps=10):
         )
 
 def pi05_model(weights, buffers, num_views, encoder_seq_len, num_steps=10):
+    pi05_vision_stage(weights, buffers, num_views)
+    pi05_encoder_stage(weights, buffers, encoder_seq_len)
+    pi05_decoder_stage(weights, buffers, encoder_seq_len, num_steps)
+
+def pi05_vision_stage(weights, buffers, num_views):
     vision_encoder(weights, buffers, num_views)
+
+def pi05_encoder_stage(weights, buffers, encoder_seq_len):
     transformer_encoder(weights, buffers, encoder_seq_len)
+
+def pi05_decoder_stage(weights, buffers, encoder_seq_len, num_steps=10):
     transformer_decoder(weights, buffers, encoder_seq_len, num_steps)
+
+@contextmanager
+def nvtx_range(name: str):
+    if not torch.cuda.is_available():
+        yield
+        return
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 class Pi05Inference:
     def __init__(
@@ -743,7 +764,9 @@ class Pi05Inference:
             self._prompt_embed_scale = float(emb_w_t.shape[1] ** 0.5)
         self.encoder_seq_len = encoder_seq_len
 
-        self.infer_graph = torch.cuda.CUDAGraph()
+        self.vision_graph = torch.cuda.CUDAGraph()
+        self.encoder_graph = torch.cuda.CUDAGraph()
+        self.decoder_graph = torch.cuda.CUDAGraph()
         self.record_infer_graph()
 
     def estimate_max_prompt_len(
@@ -792,14 +815,29 @@ class Pi05Inference:
     def record_run(self):
         pi05_model(self.weights, self.buffers, self.num_views, self.encoder_seq_len)
 
+    def record_vision_stage(self):
+        pi05_vision_stage(self.weights, self.buffers, self.num_views)
+
+    def record_encoder_stage(self):
+        pi05_encoder_stage(self.weights, self.buffers, self.encoder_seq_len)
+
+    def record_decoder_stage(self):
+        pi05_decoder_stage(self.weights, self.buffers, self.encoder_seq_len)
+
     def record_infer_graph(self):
         for _ in range(3):
             self.record_run()
         stream = torch.cuda.Stream()
         with torch.cuda.stream(stream):
-            self.infer_graph.capture_begin()
-            self.record_run()
-            self.infer_graph.capture_end()
+            self.vision_graph.capture_begin()
+            self.record_vision_stage()
+            self.vision_graph.capture_end()
+            self.encoder_graph.capture_begin()
+            self.record_encoder_stage()
+            self.encoder_graph.capture_end()
+            self.decoder_graph.capture_begin()
+            self.record_decoder_stage()
+            self.decoder_graph.capture_end()
 
     def forward(
         self,
@@ -822,5 +860,10 @@ class Pi05Inference:
         self.buffers['decoder_rope_weights'].copy_(self.get_decoder_rope_weights(prompt_len))
         self.buffers['observation_images_normalized'].copy_(observation_images_normalized)
         self.buffers['diffusion_noise'].copy_(diffusion_noise)
-        self.infer_graph.replay()
+        with nvtx_range("pi05.pipeline.vision_encoder"):
+            self.vision_graph.replay()
+        with nvtx_range("pi05.pipeline.transformer_encoder"):
+            self.encoder_graph.replay()
+        with nvtx_range("pi05.pipeline.transformer_decoder"):
+            self.decoder_graph.replay()
         return self.buffers['diffusion_noise']
