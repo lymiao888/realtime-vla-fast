@@ -3,9 +3,11 @@ import triton
 import triton.language as tl
 from contextlib import contextmanager
 
+NVTX_ENABLED = True
+
 @contextmanager
 def nvtx_range(name: str):
-    if not torch.cuda.is_available():
+    if (not NVTX_ENABLED) or (not torch.cuda.is_available()):
         yield
         return
     torch.cuda.nvtx.range_push(name)
@@ -13,6 +15,16 @@ def nvtx_range(name: str):
         yield
     finally:
         torch.cuda.nvtx.range_pop()
+
+@contextmanager
+def nvtx_enabled(enabled: bool):
+    global NVTX_ENABLED
+    prev = NVTX_ENABLED
+    NVTX_ENABLED = enabled
+    try:
+        yield
+    finally:
+        NVTX_ENABLED = prev
 
 @triton.jit
 def matmul_small_bias_res(inp_ptr, weight_ptr, out_ptr, bias_ptr, res_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden : tl.constexpr,
@@ -1360,8 +1372,10 @@ class Pi0Inference:
         pi0_model(self.weights, self.buffers, self.num_views)
     
     def record_infer_graph(self):
-        for i in range(3):
-            self.record_run()
+        # Warm-up can include compile/cache initialization; exclude from NVTX stats.
+        with nvtx_enabled(False):
+            for i in range(3):
+                self.record_run()
         stream = torch.cuda.Stream()
         with torch.cuda.stream(stream):
             self.infer_graph.capture_begin()

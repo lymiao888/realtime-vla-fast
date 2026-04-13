@@ -1,6 +1,8 @@
 import time
 import argparse
 import torch
+import pi0_infer
+import pi05_infer
 from pi0_infer import Pi0Inference
 from pi05_infer import Pi05Inference
 
@@ -14,9 +16,10 @@ def benchmark_pi0(args):
     input_noise = torch.randn(args.chunk_size, 32, dtype = torch.bfloat16).cuda()
 
     # Warm up
-    for _ in range(3):
-        _ = infer.forward(input_image, input_state, input_noise)
-        torch.cuda.synchronize()
+    with pi0_infer.nvtx_enabled(False):
+        for _ in range(3):
+            _ = infer.forward(input_image, input_state, input_noise)
+            torch.cuda.synchronize()
 
     # Benchmark
     iterations = 100
@@ -40,9 +43,11 @@ def benchmark_pi05(args):
     input_noise = torch.randn(args.chunk_size, 32, dtype=torch.bfloat16, device="cuda")
 
     # Warm up
-    for _ in range(3):
-        _ = infer.forward(input_image, input_noise)
-        torch.cuda.synchronize()
+    with pi0_infer.nvtx_enabled(False):
+        with pi05_infer.nvtx_enabled(False):
+            for _ in range(3):
+                _ = infer.forward(input_image, input_noise)
+                torch.cuda.synchronize()
 
     # Benchmark
     iterations = 100

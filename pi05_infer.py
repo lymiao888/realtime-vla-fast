@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from transformers import AutoTokenizer
 from pi0_infer import (
     vision_encoder,
+    nvtx_enabled as pi0_nvtx_enabled,
     layer_norm_matmul_n256_1152_2048_bias,
     rms_matmul_n_2048_2560_qkv_rope,
     matmul_n_2048_2048_res,
@@ -20,9 +21,11 @@ from pi0_infer import (
     matmul_abT_scale,
 )
 
+NVTX_ENABLED = True
+
 @contextmanager
 def nvtx_range(name: str):
-    if not torch.cuda.is_available():
+    if (not NVTX_ENABLED) or (not torch.cuda.is_available()):
         yield
         return
     torch.cuda.nvtx.range_push(name)
@@ -30,6 +33,16 @@ def nvtx_range(name: str):
         yield
     finally:
         torch.cuda.nvtx.range_pop()
+
+@contextmanager
+def nvtx_enabled(enabled: bool):
+    global NVTX_ENABLED
+    prev = NVTX_ENABLED
+    NVTX_ENABLED = enabled
+    try:
+        yield
+    finally:
+        NVTX_ENABLED = prev
 
 @triton.jit
 def matmul_small_res_gate(inp_ptr, weight_ptr, out_ptr, res_ptr, gate_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden : tl.constexpr,
@@ -812,8 +825,11 @@ class Pi05Inference:
         pi05_model(self.weights, self.buffers, self.num_views, self.encoder_seq_len)
 
     def record_infer_graph(self):
-        for _ in range(3):
-            self.record_run()
+        # Warm-up can include compile/cache initialization; exclude from NVTX stats.
+        with pi0_nvtx_enabled(False):
+            with nvtx_enabled(False):
+                for _ in range(3):
+                    self.record_run()
         stream = torch.cuda.Stream()
         with torch.cuda.stream(stream):
             self.infer_graph.capture_begin()
