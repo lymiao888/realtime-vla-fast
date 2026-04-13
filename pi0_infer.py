@@ -1,6 +1,18 @@
 import torch
 import triton
 import triton.language as tl
+from contextlib import contextmanager
+
+@contextmanager
+def nvtx_range(name: str):
+    if not torch.cuda.is_available():
+        yield
+        return
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 @triton.jit
 def matmul_small_bias_res(inp_ptr, weight_ptr, out_ptr, bias_ptr, res_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden : tl.constexpr,
@@ -596,54 +608,57 @@ def AttnMultiKey(QKV):
     return attn
 
 def vision_encoder(weights, buffers, num_views):
-    conv2d_embed_n256_1152_res(
-        buffers['observation_images_normalized'],
-        weights['vision_patch_embedding_w'],
-        weights['vision_patch_embedding_b'],
-        weights['vision_position_embedding'],
-        buffers['vision_x']
-    )
+    with nvtx_range("pi0.vision.embed"):
+        conv2d_embed_n256_1152_res(
+            buffers['observation_images_normalized'],
+            weights['vision_patch_embedding_w'],
+            weights['vision_patch_embedding_b'],
+            weights['vision_position_embedding'],
+            buffers['vision_x']
+        )
 
     for i in range(27):
-        layer_norm_QKV_matmul_n256_1152_3456_bias(
-            buffers['vision_x'],
-            weights['vision_pre_attn_norm_w'][i],
-            weights['vision_pre_attn_norm_b'][i],
-            weights['vision_attn_qkv_w'][i],
-            weights['vision_attn_qkv_b'][i],
-            buffers['vision_QKV'],
-            buffers['vision_x_norm']
-        )
+        with nvtx_range(f"pi0.vision.layer{i}.attn"):
+            layer_norm_QKV_matmul_n256_1152_3456_bias(
+                buffers['vision_x'],
+                weights['vision_pre_attn_norm_w'][i],
+                weights['vision_pre_attn_norm_b'][i],
+                weights['vision_attn_qkv_w'][i],
+                weights['vision_attn_qkv_b'][i],
+                buffers['vision_QKV'],
+                buffers['vision_x_norm']
+            )
 
-        attn = AttnMultiKey(buffers['vision_QKV'])
+            attn = AttnMultiKey(buffers['vision_QKV'])
 
-        matmul_n256_1152_1152_bias_res(
-            attn,
-            weights['vision_attn_o_w'][i],
-            weights['vision_attn_o_b'][i],
-            buffers['vision_x'],
-            buffers['vision_x'],
-            buffers['vision_x_split_k_buf']
-        )
+            matmul_n256_1152_1152_bias_res(
+                attn,
+                weights['vision_attn_o_w'][i],
+                weights['vision_attn_o_b'][i],
+                buffers['vision_x'],
+                buffers['vision_x'],
+                buffers['vision_x_split_k_buf']
+            )
 
-        layer_norm_matmul_n256_1152_4304_bias_gelu(
-            buffers['vision_x'],
-            weights['vision_pre_ffn_norm_w'][i],
-            weights['vision_pre_ffn_norm_b'][i],
-            weights['vision_ffn_up_w'][i],
-            weights['vision_ffn_up_b'][i],
-            buffers['vision_hidden'],
-            buffers['vision_x_norm']
-        )
+        with nvtx_range(f"pi0.vision.layer{i}.ffn"):
+            layer_norm_matmul_n256_1152_4304_bias_gelu(
+                buffers['vision_x'],
+                weights['vision_pre_ffn_norm_w'][i],
+                weights['vision_pre_ffn_norm_b'][i],
+                weights['vision_ffn_up_w'][i],
+                weights['vision_ffn_up_b'][i],
+                buffers['vision_hidden'],
+                buffers['vision_x_norm']
+            )
 
-        matmul_n256_4304_1152_bias_res(
-            buffers['vision_hidden'],
-            weights['vision_ffn_down_w'][i],
-            weights['vision_ffn_down_b'][i],
-            buffers['vision_x'],
-            buffers['vision_x'],
-            buffers['vision_x_split_k_buf']
-        )
+            matmul_n256_4304_1152_bias_res(
+                buffers['vision_hidden'],
+                weights['vision_ffn_down_w'][i],
+                weights['vision_ffn_down_b'][i],
+                buffers['vision_x'],
+                buffers['vision_x'],
+                buffers['vision_x_split_k_buf']
+            )
 
 @triton.jit
 def rms_norm_kernel(inp_ptr, out_ptr, seq_len : tl.constexpr, features : tl.constexpr):
