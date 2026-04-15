@@ -620,7 +620,7 @@ def AttnMultiKey(QKV):
     return attn
 
 def vision_encoder(weights, buffers, num_views):
-    with nvtx_range("pi0.vision.embed"):
+    with nvtx_range("pi0.vision.conv2d_embed_n256_1152_res"):
         conv2d_embed_n256_1152_res(
             buffers['observation_images_normalized'],
             weights['vision_patch_embedding_w'],
@@ -630,7 +630,7 @@ def vision_encoder(weights, buffers, num_views):
         )
 
     for i in range(27):
-        with nvtx_range(f"pi0.vision.layer{i}.attn"):
+        with nvtx_range("pi0.vision.layer_norm_QKV_matmul_n256_1152_3456_bias"):
             layer_norm_QKV_matmul_n256_1152_3456_bias(
                 buffers['vision_x'],
                 weights['vision_pre_attn_norm_w'][i],
@@ -641,8 +641,10 @@ def vision_encoder(weights, buffers, num_views):
                 buffers['vision_x_norm']
             )
 
+        with nvtx_range("pi0.vision.AttnMultiKey"):
             attn = AttnMultiKey(buffers['vision_QKV'])
 
+        with nvtx_range("pi0.vision.matmul_n256_1152_1152_bias_res"):
             matmul_n256_1152_1152_bias_res(
                 attn,
                 weights['vision_attn_o_w'][i],
@@ -652,7 +654,7 @@ def vision_encoder(weights, buffers, num_views):
                 buffers['vision_x_split_k_buf']
             )
 
-        with nvtx_range(f"pi0.vision.layer{i}.ffn"):
+        with nvtx_range("pi0.vision.layer_norm_matmul_n256_1152_4304_bias_gelu"):
             layer_norm_matmul_n256_1152_4304_bias_gelu(
                 buffers['vision_x'],
                 weights['vision_pre_ffn_norm_w'][i],
@@ -663,6 +665,7 @@ def vision_encoder(weights, buffers, num_views):
                 buffers['vision_x_norm']
             )
 
+        with nvtx_range("pi0.vision.matmul_n256_4304_1152_bias_res"):
             matmul_n256_4304_1152_bias_res(
                 buffers['vision_hidden'],
                 weights['vision_ffn_down_w'][i],
@@ -866,49 +869,55 @@ def matmul_n_2048_2048_res(x, weight, out):
     )
 
 def transformer_encoder(weights, buffers, encoder_seq_len):
-    layer_norm_matmul_n256_1152_2048_bias(
-        buffers['vision_x'],
-        weights['vision_final_norm_w'], 
-        weights['vision_final_norm_b'],
-        weights['encoder_multi_modal_projector_w'],
-        weights['encoder_multi_modal_projector_b'],
-        buffers['encoder_x'],
-        buffers['vision_x_norm']
-    )
-    for i in range(18):
-        rms_matmul_n_2048_2560_qkv_rope(
+    with nvtx_range("pi0.transformer_encoder.layer_norm_matmul_n256_1152_2048_bias"):
+        layer_norm_matmul_n256_1152_2048_bias(
+            buffers['vision_x'],
+            weights['vision_final_norm_w'], 
+            weights['vision_final_norm_b'],
+            weights['encoder_multi_modal_projector_w'],
+            weights['encoder_multi_modal_projector_b'],
             buffers['encoder_x'],
-            weights['encoder_attn_qkv_w'][i],
-            buffers['encoder_rope_weights'],
-            buffers['encoder_Q'],
-            buffers['encoder_K'][i, :encoder_seq_len],
-            buffers['encoder_V'][i, :encoder_seq_len],
-            buffers['encoder_x_norm']
+            buffers['vision_x_norm']
         )
-
-        if i != 17:
-            scale = 1.0 / (256 ** 0.5)
-            attn = AttnSingleKey(buffers['encoder_Q'], buffers['encoder_K'][i, :encoder_seq_len], buffers['encoder_V'][i, :encoder_seq_len], scale)
-            
-            matmul_n_2048_2048_res(
-                attn,
-                weights['encoder_attn_o_w'][i],
-                buffers['encoder_x']
-            )
-        
-            rms_matmul_n_2048_16384_gate(
+    for i in range(18):
+        with nvtx_range("pi0.transformer_encoder.rms_matmul_n_2048_2560_qkv_rope"):
+            rms_matmul_n_2048_2560_qkv_rope(
                 buffers['encoder_x'],
-                weights['encoder_ffn_gate_w'][i],
-                weights['encoder_ffn_up_w'][i],
-                buffers['encoder_hidden'],
+                weights['encoder_attn_qkv_w'][i],
+                buffers['encoder_rope_weights'],
+                buffers['encoder_Q'],
+                buffers['encoder_K'][i, :encoder_seq_len],
+                buffers['encoder_V'][i, :encoder_seq_len],
                 buffers['encoder_x_norm']
             )
 
-            matmul_n_16384_2048_res(
-                buffers['encoder_hidden'],
-                weights['encoder_ffn_down_w'][i],
-                buffers['encoder_x']
-            )
+        if i != 17:
+            scale = 1.0 / (256 ** 0.5)
+            with nvtx_range("pi0.transformer_encoder.AttnSingleKey"):
+                attn = AttnSingleKey(buffers['encoder_Q'], buffers['encoder_K'][i, :encoder_seq_len], buffers['encoder_V'][i, :encoder_seq_len], scale)
+            
+            with nvtx_range("pi0.transformer_encoder.matmul_n_2048_2048_res"):
+                matmul_n_2048_2048_res(
+                    attn,
+                    weights['encoder_attn_o_w'][i],
+                    buffers['encoder_x']
+                )
+        
+            with nvtx_range("pi0.transformer_encoder.rms_matmul_n_2048_16384_gate"):
+                rms_matmul_n_2048_16384_gate(
+                    buffers['encoder_x'],
+                    weights['encoder_ffn_gate_w'][i],
+                    weights['encoder_ffn_up_w'][i],
+                    buffers['encoder_hidden'],
+                    buffers['encoder_x_norm']
+                )
+
+            with nvtx_range("pi0.transformer_encoder.matmul_n_16384_2048_res"):
+                matmul_n_16384_2048_res(
+                    buffers['encoder_hidden'],
+                    weights['encoder_ffn_down_w'][i],
+                    buffers['encoder_x']
+                )
 
 @triton.jit
 def matvec_bias_kernel(x_ptr, weight_ptr, bias_ptr, out_ptr, features : tl.constexpr, hidden : tl.constexpr):
@@ -1190,71 +1199,81 @@ def matmul_k_4096_1024_res(x, weight, out):
     )
 
 def transformer_decoder(weights, buffers, encoder_seq_len):
-    matmul_1_32_1024_bias(
-        buffers['observation_state_normalized'],
-        weights['decoder_state_in_proj_w'],
-        weights['decoder_state_in_proj_b'],
-        buffers['decoder_state_buf']
-    )
+    with nvtx_range("pi0.transformer_decoder.matmul_1_32_1024_bias"):
+        matmul_1_32_1024_bias(
+            buffers['observation_state_normalized'],
+            weights['decoder_state_in_proj_w'],
+            weights['decoder_state_in_proj_b'],
+            buffers['decoder_state_buf']
+        )
     for step in range(10):
         buffers['decoder_x'][:1].copy_(buffers['decoder_state_buf'])
-        matmul_k_32_1024_bias_silu(
-            buffers['diffusion_noise'],
-            weights['decoder_action_fused_in_proj_w'],
-            weights['decoder_action_fused_time_biases'][step%10],
-            buffers['decoder_x_buf']
-        )
-        matmul_k_1024_1024_bias(
-            buffers['decoder_x_buf'],
-            weights['decoder_action_mlp_w'],
-            weights['decoder_action_mlp_b'],
-            buffers['decoder_x'][1:]
-        )
+        with nvtx_range("pi0.transformer_decoder.matmul_k_32_1024_bias_silu"):
+            matmul_k_32_1024_bias_silu(
+                buffers['diffusion_noise'],
+                weights['decoder_action_fused_in_proj_w'],
+                weights['decoder_action_fused_time_biases'][step%10],
+                buffers['decoder_x_buf']
+            )
+        with nvtx_range("pi0.transformer_decoder.matmul_k_1024_1024_bias"):
+            matmul_k_1024_1024_bias(
+                buffers['decoder_x_buf'],
+                weights['decoder_action_mlp_w'],
+                weights['decoder_action_mlp_b'],
+                buffers['decoder_x'][1:]
+            )
         for i in range(18):
-            rms_matmul_k_1024_2560_qkv_rope(
-                buffers['decoder_x'], weights['decoder_attn_qkv_w'][i],
-                buffers['decoder_rope_weights'],
-                buffers['decoder_q_buf'],
-                buffers['encoder_K'][i][encoder_seq_len:],
-                buffers['encoder_V'][i][encoder_seq_len:],
-                buffers['decoder_norm_factor_buf']
-            )
-            matmul_k8_256_n_softmax_mask0(
-                buffers['decoder_q_buf'],
-                buffers['encoder_K'][i],
-                buffers['decoder_attn_buf'],
-                encoder_seq_len
-            )
-            matmul_k8_n_256(
-                buffers['decoder_attn_buf'],
-                buffers['encoder_V'][i],
-                buffers['decoder_q_buf']
-            )
+            with nvtx_range("pi0.transformer_decoder.rms_matmul_k_1024_2560_qkv_rope"):
+                rms_matmul_k_1024_2560_qkv_rope(
+                    buffers['decoder_x'], weights['decoder_attn_qkv_w'][i],
+                    buffers['decoder_rope_weights'],
+                    buffers['decoder_q_buf'],
+                    buffers['encoder_K'][i][encoder_seq_len:],
+                    buffers['encoder_V'][i][encoder_seq_len:],
+                    buffers['decoder_norm_factor_buf']
+                )
+            with nvtx_range("pi0.transformer_decoder.matmul_k8_256_n_softmax_mask0"):
+                matmul_k8_256_n_softmax_mask0(
+                    buffers['decoder_q_buf'],
+                    buffers['encoder_K'][i],
+                    buffers['decoder_attn_buf'],
+                    encoder_seq_len
+                )
+            with nvtx_range("pi0.transformer_decoder.matmul_k8_n_256"):
+                matmul_k8_n_256(
+                    buffers['decoder_attn_buf'],
+                    buffers['encoder_V'][i],
+                    buffers['decoder_q_buf']
+                )
 
-            matmul_k_2048_1024_res(
-                buffers['decoder_q_buf'].view(-1, 2048),
-                weights['decoder_attn_o_w'][i],
-                buffers['decoder_x']
+            with nvtx_range("pi0.transformer_decoder.matmul_k_2048_1024_res"):
+                matmul_k_2048_1024_res(
+                    buffers['decoder_q_buf'].view(-1, 2048),
+                    weights['decoder_attn_o_w'][i],
+                    buffers['decoder_x']
+                )
+            with nvtx_range("pi0.transformer_decoder.rms_matmul_k_1024_4096_gate"):
+                rms_matmul_k_1024_4096_gate(
+                    buffers['decoder_x'],
+                    weights['decoder_ffn_gate_w'][i],
+                    weights['decoder_ffn_up_w'][i],
+                    buffers['decoder_hidden'],
+                    buffers['decoder_norm_factor_buf']
+                )
+            with nvtx_range("pi0.transformer_decoder.matmul_k_4096_1024_res"):
+                matmul_k_4096_1024_res(
+                    buffers['decoder_hidden'],
+                    weights['decoder_ffn_down_w'][i],
+                    buffers['decoder_x']
+                )
+        with nvtx_range("pi0.transformer_decoder.rms_matmul_k_1024_32_bias_res"):
+            rms_matmul_k_1024_32_bias_res(
+                buffers['decoder_x'][1:],
+                weights['decoder_action_fused_out_proj_w'],
+                weights['decoder_action_fused_out_proj_b'],
+                buffers['diffusion_noise'],
+                buffers['decoder_norm_factor_buf'],
             )
-            rms_matmul_k_1024_4096_gate(
-                buffers['decoder_x'],
-                weights['decoder_ffn_gate_w'][i],
-                weights['decoder_ffn_up_w'][i],
-                buffers['decoder_hidden'],
-                buffers['decoder_norm_factor_buf']
-            )
-            matmul_k_4096_1024_res(
-                buffers['decoder_hidden'],
-                weights['decoder_ffn_down_w'][i],
-                buffers['decoder_x']
-            )
-        rms_matmul_k_1024_32_bias_res(
-            buffers['decoder_x'][1:],
-            weights['decoder_action_fused_out_proj_w'],
-            weights['decoder_action_fused_out_proj_b'],
-            buffers['diffusion_noise'],
-            buffers['decoder_norm_factor_buf'],
-        )
 
 def pi0_model(weights, buffers, num_views):
     encoder_seq_len = buffers['encoder_x'].shape[0]

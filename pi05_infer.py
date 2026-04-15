@@ -334,7 +334,7 @@ def softmax_kernel_masklen(
                  mask=(offs_i < queries) & (offs_j < keys))
 
 def transformer_encoder(weights, buffers, encoder_seq_len):
-    with nvtx_range("pi05.encoder.input_proj"):
+    with nvtx_range("pi05.transformer_encoder.layer_norm_matmul_n256_1152_2048_bias"):
         layer_norm_matmul_n256_1152_2048_bias(
             buffers['vision_x'],
             weights['vision_final_norm_w'],
@@ -345,7 +345,7 @@ def transformer_encoder(weights, buffers, encoder_seq_len):
             buffers['vision_x_norm']
         )
     for i in range(18):
-        with nvtx_range(f"pi05.encoder.layer{i}.attn"):
+        with nvtx_range("pi05.transformer_encoder.rms_matmul_n_2048_2560_qkv_rope"):
             rms_matmul_n_2048_2560_qkv_rope(
                 buffers['encoder_x'],
                 weights['encoder_attn_qkv_w'][i],
@@ -355,10 +355,11 @@ def transformer_encoder(weights, buffers, encoder_seq_len):
                 buffers['encoder_V'][i, :encoder_seq_len],
                 buffers['encoder_x_norm']
             )
-            if i != 17:
-                scale = 1.0 / (256 ** 0.5)
-                total_queries = buffers['encoder_Q'].shape[0]
-                total_keys = encoder_seq_len
+        if i != 17:
+            scale = 1.0 / (256 ** 0.5)
+            total_queries = buffers['encoder_Q'].shape[0]
+            total_keys = encoder_seq_len
+            with nvtx_range("pi05.transformer_encoder.matmul_abT_scale"):
                 matmul_abT_scale[(((total_queries + 31) // 32) * ((total_keys + 31) // 32),)](
                     buffers['encoder_Q'],
                     buffers['encoder_K'][i, :encoder_seq_len],
@@ -371,6 +372,7 @@ def transformer_encoder(weights, buffers, encoder_seq_len):
                     BLOCK_SIZE_N=32,
                     BLOCK_SIZE_K=64,
                 )
+            with nvtx_range("pi05.transformer_encoder.softmax_kernel_masklen"):
                 softmax_kernel_masklen[((total_queries + 3) // 4,)](
                     buffers['encoder_logits_buf'],
                     total_queries,
@@ -380,19 +382,21 @@ def transformer_encoder(weights, buffers, encoder_seq_len):
                     BLOCK_SIZE_M=4,
                     BLOCK_SIZE=1024,
                 )
+            with nvtx_range("pi05.transformer_encoder.matmul_k8_n_256"):
                 matmul_k8_n_256(
                     buffers['encoder_attn_buf'],
                     buffers['encoder_V'][i, :encoder_seq_len],
                     buffers['encoder_ctx_buf'],
                 )
-                
+            
+            with nvtx_range("pi05.transformer_encoder.matmul_n_2048_2048_res"):
                 matmul_n_2048_2048_res(
                     buffers['encoder_ctx_buf'].view(-1, 2048),
                     weights['encoder_attn_o_w'][i],
                     buffers['encoder_x']
                 )
 
-            with nvtx_range(f"pi05.encoder.layer{i}.ffn"):
+            with nvtx_range("pi05.transformer_encoder.rms_matmul_n_2048_16384_gate"):
                 rms_matmul_n_2048_16384_gate(
                     buffers['encoder_x'],
                     weights['encoder_ffn_gate_w'][i],
@@ -401,6 +405,7 @@ def transformer_encoder(weights, buffers, encoder_seq_len):
                     buffers['encoder_x_norm']
                 )
 
+            with nvtx_range("pi05.transformer_encoder.matmul_n_16384_2048_res"):
                 matmul_n_16384_2048_res(
                     buffers['encoder_hidden'],
                     weights['encoder_ffn_down_w'][i],
@@ -445,7 +450,7 @@ def softmax_kernel_prefix_suffix(
 
 def transformer_decoder(weights, buffers, encoder_seq_len, num_steps=10):
     for step in range(num_steps):
-        with nvtx_range(f"pi05.decoder.step{step}.input_proj"):
+        with nvtx_range("pi05.transformer_decoder.matmul_k_32_1024_bias"):
             matmul_k_32_1024_bias(
                 buffers['diffusion_noise'],
                 weights['decoder_action_in_proj_w'],
@@ -454,7 +459,7 @@ def transformer_decoder(weights, buffers, encoder_seq_len, num_steps=10):
             )
         seq_len = buffers['decoder_x'].shape[0]
         for i in range(18):
-            with nvtx_range(f"pi05.decoder.step{step}.layer{i}.attn"):
+            with nvtx_range("pi05.transformer_decoder.adarms_norm_style_proj"):
                 adarms_norm_style_proj(
                     buffers['decoder_x'],
                     buffers['decoder_time_emb'][step],
@@ -464,6 +469,7 @@ def transformer_decoder(weights, buffers, encoder_seq_len, num_steps=10):
                     buffers['gate_buf'],
                     buffers['decoder_style_attn'][step, i]
                 )
+            with nvtx_range("pi05.transformer_decoder.matmul_k_1024_2560_qkv_rope"):
                 matmul_k_1024_2560_qkv_rope(
                     buffers['x_normed_buf'], 
                     weights['decoder_attn_qkv_w'][i],
@@ -472,11 +478,12 @@ def transformer_decoder(weights, buffers, encoder_seq_len, num_steps=10):
                     buffers['encoder_K'][i, encoder_seq_len:encoder_seq_len + seq_len],
                     buffers['encoder_V'][i, encoder_seq_len:encoder_seq_len + seq_len],
                 )
-                total_queries = buffers['decoder_q_buf'].shape[0]
-                prefix_keys = encoder_seq_len
-                suffix_keys = seq_len
-                total_keys = prefix_keys + suffix_keys
+            total_queries = buffers['decoder_q_buf'].shape[0]
+            prefix_keys = encoder_seq_len
+            suffix_keys = seq_len
+            total_keys = prefix_keys + suffix_keys
 
+            with nvtx_range("pi05.transformer_decoder.matmul_abT_scale"):
                 matmul_abT_scale[(((total_queries + 31) // 32) * ((total_keys + 31) // 32),)](
                     buffers['decoder_q_buf'],
                     buffers['encoder_K'][i, :encoder_seq_len + seq_len],
@@ -490,6 +497,7 @@ def transformer_decoder(weights, buffers, encoder_seq_len, num_steps=10):
                     BLOCK_SIZE_K=64,
                 )
 
+            with nvtx_range("pi05.transformer_decoder.softmax_kernel_prefix_suffix"):
                 softmax_kernel_prefix_suffix[((total_queries + 3) // 4,)](
                     buffers['decoder_logits_buf'],
                     total_queries,
@@ -501,11 +509,13 @@ def transformer_decoder(weights, buffers, encoder_seq_len, num_steps=10):
                     BLOCK_SIZE=1024,
                 )
 
+            with nvtx_range("pi05.transformer_decoder.matmul_k8_n_256"):
                 matmul_k8_n_256(
                     buffers['decoder_attn_buf'],
                     buffers['encoder_V'][i, :encoder_seq_len + seq_len],
                     buffers['decoder_q_buf'],
                 )
+            with nvtx_range("pi05.transformer_decoder.matmul_k_2048_1024_gate"):
                 matmul_k_2048_1024_gate(
                     buffers['decoder_q_buf'].view(-1, 2048),
                     weights['decoder_attn_o_w'][i],
@@ -513,7 +523,7 @@ def transformer_decoder(weights, buffers, encoder_seq_len, num_steps=10):
                     buffers['gate_buf']
                 )
 
-            with nvtx_range(f"pi05.decoder.step{step}.layer{i}.ffn"):
+            with nvtx_range("pi05.transformer_decoder.adarms_norm_style_proj"):
                 adarms_norm_style_proj(
                     buffers['decoder_x'],
                     buffers['decoder_time_emb'][step],
@@ -523,8 +533,9 @@ def transformer_decoder(weights, buffers, encoder_seq_len, num_steps=10):
                     buffers['gate_buf'],
                     buffers['decoder_style_ffn'][step, i]
                 )
-                seq_len = buffers['decoder_x'].shape[0]
-                matmul_small_gate[( (seq_len + 127) // 128, (4096 + 63) // 64 )](
+            seq_len = buffers['decoder_x'].shape[0]
+            with nvtx_range("pi05.transformer_decoder.matmul_small_gate"):
+                matmul_small_gate[((seq_len + 127) // 128, (4096 + 63) // 64)](
                     buffers['x_normed_buf'],
                     weights['decoder_ffn_gate_w'][i],
                     weights['decoder_ffn_up_w'][i],
@@ -533,6 +544,7 @@ def transformer_decoder(weights, buffers, encoder_seq_len, num_steps=10):
                     1024,
                     4096,
                 )
+            with nvtx_range("pi05.transformer_decoder.matmul_k_4096_1024_gate"):
                 matmul_k_4096_1024_gate(
                     buffers['decoder_hidden'],
                     weights['decoder_ffn_down_w'][i],
@@ -540,7 +552,7 @@ def transformer_decoder(weights, buffers, encoder_seq_len, num_steps=10):
                     buffers['gate_buf']
                 )
 
-        with nvtx_range(f"pi05.decoder.step{step}.output_proj"):
+        with nvtx_range("pi05.transformer_decoder.adarms_matmul_k_1024_32_bias_res"):
             adarms_matmul_k_1024_32_bias_res(
                 buffers['decoder_x'],
                 buffers['decoder_time_emb'][step],
