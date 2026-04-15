@@ -20,6 +20,8 @@ from pi0_infer import (
     matmul_abT_scale,
 )
 
+NVTX_ENABLED = True
+
 @triton.jit
 def matmul_small_res_gate(inp_ptr, weight_ptr, out_ptr, res_ptr, gate_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden : tl.constexpr,
                          BLOCK_SIZE_N : tl.constexpr, BLOCK_SIZE_M : tl.constexpr, BLOCK_SIZE_K : tl.constexpr):
@@ -538,15 +540,28 @@ def pi05_decoder_stage(weights, buffers, encoder_seq_len, num_steps=10):
     transformer_decoder(weights, buffers, encoder_seq_len, num_steps)
 
 @contextmanager
-def nvtx_range(name: str):
-    if not torch.cuda.is_available():
+def nvtx_range(name: str, sync_cuda: bool = False):
+    if (not NVTX_ENABLED) or (not torch.cuda.is_available()):
         yield
         return
     torch.cuda.nvtx.range_push(name)
     try:
         yield
     finally:
+        # Force stream completion so NVTX duration includes GPU execution time.
+        if sync_cuda:
+            torch.cuda.synchronize()
         torch.cuda.nvtx.range_pop()
+
+@contextmanager
+def nvtx_enabled(enabled: bool):
+    global NVTX_ENABLED
+    prev = NVTX_ENABLED
+    NVTX_ENABLED = enabled
+    try:
+        yield
+    finally:
+        NVTX_ENABLED = prev
 
 class Pi05Inference:
     def __init__(
@@ -559,6 +574,7 @@ class Pi05Inference:
         discrete_state_input: bool = True,
         max_prompt_text: str | None = None,
         state_dim_for_max_prompt: int | None = None,
+        use_cuda_graph: bool = True,
     ):
         self.discrete_state_input = discrete_state_input
         self.tokenizer_path = tokenizer_path
@@ -566,6 +582,7 @@ class Pi05Inference:
         self.num_views = num_views
         self.chunk_size = chunk_size
         self.max_tokenize_len = int(max_tokenize_len)
+        self.use_cuda_graph = bool(use_cuda_graph)
         if discrete_state_input:
             self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
             if max_prompt_text is not None and state_dim_for_max_prompt is not None:
@@ -764,10 +781,15 @@ class Pi05Inference:
             self._prompt_embed_scale = float(emb_w_t.shape[1] ** 0.5)
         self.encoder_seq_len = encoder_seq_len
 
-        self.vision_graph = torch.cuda.CUDAGraph()
-        self.encoder_graph = torch.cuda.CUDAGraph()
-        self.decoder_graph = torch.cuda.CUDAGraph()
-        self.record_infer_graph()
+        if self.use_cuda_graph:
+            self.vision_graph = torch.cuda.CUDAGraph()
+            self.encoder_graph = torch.cuda.CUDAGraph()
+            self.decoder_graph = torch.cuda.CUDAGraph()
+            self.record_infer_graph()
+        else:
+            self.vision_graph = None
+            self.encoder_graph = None
+            self.decoder_graph = None
 
     def estimate_max_prompt_len(
         self,
@@ -860,10 +882,18 @@ class Pi05Inference:
         self.buffers['decoder_rope_weights'].copy_(self.get_decoder_rope_weights(prompt_len))
         self.buffers['observation_images_normalized'].copy_(observation_images_normalized)
         self.buffers['diffusion_noise'].copy_(diffusion_noise)
-        with nvtx_range("pi05.pipeline.vision_encoder"):
-            self.vision_graph.replay()
-        with nvtx_range("pi05.pipeline.transformer_encoder"):
-            self.encoder_graph.replay()
-        with nvtx_range("pi05.pipeline.transformer_decoder"):
-            self.decoder_graph.replay()
+        if self.use_cuda_graph:
+            with nvtx_range("pi05.pipeline.vision_encoder", sync_cuda=True):
+                self.vision_graph.replay()
+            with nvtx_range("pi05.pipeline.transformer_encoder", sync_cuda=True):
+                self.encoder_graph.replay()
+            with nvtx_range("pi05.pipeline.transformer_decoder", sync_cuda=True):
+                self.decoder_graph.replay()
+        else:
+            with nvtx_range("pi05.pipeline.vision_encoder", sync_cuda=True):
+                self.record_vision_stage()
+            with nvtx_range("pi05.pipeline.transformer_encoder", sync_cuda=True):
+                self.record_encoder_stage()
+            with nvtx_range("pi05.pipeline.transformer_decoder", sync_cuda=True):
+                self.record_decoder_stage()
         return self.buffers['diffusion_noise']
