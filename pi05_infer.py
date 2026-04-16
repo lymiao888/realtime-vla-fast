@@ -12,11 +12,11 @@ from pi0_infer import (
     rms_matmul_n_2048_2560_qkv_rope,
     matmul_n_2048_2048_res,
     matmul_n_16384_2048_res,
-    rms_matmul_n_2048_16384_gate,
+    rms_matmul_n_2048_16384_gate_encoder,
     matmul_small_bias,
     matmul_small_bias_res,
     matmul_small_bias_silu,
-    matmul_small_gate,
+    matmul_k_1024_4096_gate_decoder,
     matmul_k8_n_256,
     matmul_abT_scale,
 )
@@ -391,7 +391,7 @@ def transformer_encoder(weights, buffers, encoder_seq_len):
                 buffers['encoder_x']
             )
         
-            rms_matmul_n_2048_16384_gate(
+            rms_matmul_n_2048_16384_gate_encoder(
                 buffers['encoder_x'],
                 weights['encoder_ffn_gate_w'][i],
                 weights['encoder_ffn_up_w'][i],
@@ -518,16 +518,12 @@ def transformer_decoder(weights, buffers, encoder_seq_len, num_steps=10):
                 buffers['decoder_style_ffn'][step, i]
             )
             seq_len = buffers['decoder_x'].shape[0]
-            with nvtx_range("matmul_small_gate_decoder"):
-                matmul_small_gate[( (seq_len + 127) // 128, (4096 + 63) // 64 )](
-                    buffers['x_normed_buf'],
-                    weights['decoder_ffn_gate_w'][i],
-                    weights['decoder_ffn_up_w'][i],
-                    buffers['decoder_hidden'],
-                    seq_len,
-                    1024,
-                    4096,
-                )
+            matmul_k_1024_4096_gate_decoder(
+                buffers['x_normed_buf'],
+                weights['decoder_ffn_gate_w'][i],
+                weights['decoder_ffn_up_w'][i],
+                buffers['decoder_hidden']
+            )
             matmul_k_4096_1024_gate(
                 buffers['decoder_hidden'],
                 weights['decoder_ffn_down_w'][i],

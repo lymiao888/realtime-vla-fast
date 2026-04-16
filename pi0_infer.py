@@ -689,8 +689,18 @@ def rms_norm_kernel(inp_ptr, out_ptr, seq_len : tl.constexpr, features : tl.cons
             x = tl.load(inp_ptr + i * features + j + tl.arange(0, BLOCK_SIZE))
             x = x * factor
             tl.store(out_ptr + i * features + j + tl.arange(0, BLOCK_SIZE), x)
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE_N": 128, "BLOCK_SIZE_M": 64, "BLOCK_SIZE_K": 32}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_SIZE_N": 128, "BLOCK_SIZE_M": 64, "BLOCK_SIZE_K": 32}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_SIZE_N": 128, "BLOCK_SIZE_M": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_SIZE_N": 64, "BLOCK_SIZE_M": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_SIZE_N": 128, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_K": 32}, num_warps=4, num_stages=4),
+    ],
+    key=["seq_len"],
+)
 @triton.jit
-def matmul_small_gate(inp_ptr, weight1_ptr, weight2_ptr, out_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden: tl.constexpr,
+def matmul_small_gate_encoder_kernel(inp_ptr, weight1_ptr, weight2_ptr, out_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden: tl.constexpr,
     BLOCK_SIZE_N : tl.constexpr = 128,
     BLOCK_SIZE_M : tl.constexpr = 64,
     BLOCK_SIZE_K : tl.constexpr = 32):
@@ -717,6 +727,59 @@ def matmul_small_gate(inp_ptr, weight1_ptr, weight2_ptr, out_ptr, seq_len : tl.c
             acc = acc * tl.sigmoid(1.5957691216057308 * acc * (1 + 0.044715 * acc * acc))
             acc = (acc * acc2).to(tl.bfloat16)
             tl.store(out_ptr + (i + tl.arange(0, BLOCK_SIZE_N)[:, None]) * hidden + j + tl.arange(0, BLOCK_SIZE_M), acc, mask = i + tl.arange(0, BLOCK_SIZE_N)[:, None] < seq_len)
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE_N": 64, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_SIZE_N": 64, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_SIZE_N": 32, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_SIZE_N": 32, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=3),
+    ],
+    key=["seq_len"],
+)
+@triton.jit
+def matmul_small_gate_decoder_kernel(inp_ptr, weight1_ptr, weight2_ptr, out_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden: tl.constexpr,
+    BLOCK_SIZE_N : tl.constexpr = 64,
+    BLOCK_SIZE_M : tl.constexpr = 128,
+    BLOCK_SIZE_K : tl.constexpr = 64):
+
+    pid = tl.program_id(0)
+    grid_j = tl.cdiv(hidden, BLOCK_SIZE_M)
+    i = (pid // grid_j) * BLOCK_SIZE_N
+    j = (pid % grid_j) * BLOCK_SIZE_M
+
+    offs_i = i + tl.arange(0, BLOCK_SIZE_N)[:, None]
+    offs_j = j + tl.arange(0, BLOCK_SIZE_M)[None, :]
+
+    acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+    acc2 = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+    for k in range(0, features, BLOCK_SIZE_K):
+        offs_k = k + tl.arange(0, BLOCK_SIZE_K)
+        x = tl.load(
+            inp_ptr + offs_i * features + offs_k[None, :],
+            mask = (offs_i < seq_len) & (offs_k[None, :] < features),
+            other = 0.0
+        )
+        w = tl.load(
+            weight1_ptr + offs_k[:, None] * hidden + offs_j,
+            mask = (offs_k[:, None] < features) & (offs_j < hidden),
+            other = 0.0
+        )
+        acc = tl.dot(x, w, acc)
+        w2 = tl.load(
+            weight2_ptr + offs_k[:, None] * hidden + offs_j,
+            mask = (offs_k[:, None] < features) & (offs_j < hidden),
+            other = 0.0
+        )
+        acc2 = tl.dot(x, w2, acc2)
+    acc = acc * tl.sigmoid(1.5957691216057308 * acc * (1 + 0.044715 * acc * acc))
+    acc = (acc * acc2).to(tl.bfloat16)
+    tl.store(
+        out_ptr + offs_i * hidden + offs_j,
+        acc,
+        mask = (offs_i < seq_len) & (offs_j < hidden)
+    )
+
 
 @triton.jit
 def scaled_matmul_small_gate(inp_ptr, inp_norm_factor_ptr, weight1_ptr, weight2_ptr, out_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden: tl.constexpr,
@@ -752,13 +815,25 @@ def scaled_matmul_small_gate(inp_ptr, inp_norm_factor_ptr, weight1_ptr, weight2_
         acc = (acc * acc2).to(tl.bfloat16)
         tl.store(out_ptr + (i + tl.arange(0, BLOCK_SIZE_N)[:, None]) * hidden + j + tl.arange(0, BLOCK_SIZE_M), acc, mask = i + tl.arange(0, BLOCK_SIZE_N)[:, None] < seq_len)
 
-def rms_matmul_n_2048_16384_gate(x, weight1, weight2, out, x_norm):
+def rms_matmul_n_2048_16384_gate_encoder(x, weight1, weight2, out, x_norm):
     seq_len = x.shape[0]
     rms_norm_kernel[(seq_len,)](x, x_norm, seq_len, 2048)
-    matmul_small_gate[( (seq_len + 127)//128, (16384 + 63)//64 )](
-        x_norm, weight1, weight2, out, seq_len,
-        2048, 16384
+    grid = lambda META: (triton.cdiv(seq_len, META["BLOCK_SIZE_N"]), triton.cdiv(16384, META["BLOCK_SIZE_M"]))
+    matmul_small_gate_encoder_kernel[grid](
+        x_norm, weight1, weight2, out,
+        seq_len = seq_len,
+        features = 2048,
+        hidden = 16384,
     )
+
+def matmul_k_1024_4096_gate_decoder(x, weight1, weight2, out):
+    seq_len = x.shape[0]
+    grid = lambda META: (triton.cdiv(seq_len, META["BLOCK_SIZE_N"]) * triton.cdiv(4096, META["BLOCK_SIZE_M"]),)
+    with nvtx_range("matmul_small_gate_decoder"):
+        matmul_small_gate_decoder_kernel[grid](
+            x, weight1, weight2, out, seq_len,
+            1024, 4096,
+        )
 
 def matmul_n_16384_2048_res(x, weight, out):
     seq_len = x.shape[0]
@@ -897,7 +972,7 @@ def transformer_encoder(weights, buffers, encoder_seq_len):
                 buffers['encoder_x']
             )
         
-            rms_matmul_n_2048_16384_gate(
+            rms_matmul_n_2048_16384_gate_encoder(
                 buffers['encoder_x'],
                 weights['encoder_ffn_gate_w'][i],
                 weights['encoder_ffn_up_w'][i],
