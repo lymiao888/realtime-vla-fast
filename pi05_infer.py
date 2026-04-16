@@ -275,35 +275,37 @@ def adarms_matmul_k_1024_32_bias_res(
 
 def matmul_k_2048_1024_gate(x, weight, out, gate):
     seq_len = x.shape[0]
-    matmul_small_res_gate[(128,)](
-        x,
-        weight,
-        out,
-        out, 
-        gate,
-        seq_len = seq_len,
-        features = 2048,
-        hidden = 1024,
-        BLOCK_SIZE_N = 32,
-        BLOCK_SIZE_M = 32,
-        BLOCK_SIZE_K = 128
-    )
+    with nvtx_range("matmul_small_res_gate_2048_1024"):
+        matmul_small_res_gate[(128,)](
+            x,
+            weight,
+            out,
+            out, 
+            gate,
+            seq_len = seq_len,
+            features = 2048,
+            hidden = 1024,
+            BLOCK_SIZE_N = 32,
+            BLOCK_SIZE_M = 32,
+            BLOCK_SIZE_K = 128
+        )
 
 def matmul_k_4096_1024_gate(x, weight, out, gate):
     seq_len = x.shape[0]
-    matmul_small_res_gate[(((seq_len + 15) // 16) * (1024 // 32),)](
-        x,
-        weight,
-        out,
-        out,
-        gate,
-        seq_len = seq_len,
-        features = 4096,
-        hidden = 1024,
-        BLOCK_SIZE_N = 16,
-        BLOCK_SIZE_M = 32,
-        BLOCK_SIZE_K = 256
-    )
+    with nvtx_range("matmul_small_res_gate_4096_1024"):
+        matmul_small_res_gate[(((seq_len + 15) // 16) * (1024 // 32),)](
+            x,
+            weight,
+            out,
+            out,
+            gate,
+            seq_len = seq_len,
+            features = 4096,
+            hidden = 1024,
+            BLOCK_SIZE_N = 16,
+            BLOCK_SIZE_M = 32,
+            BLOCK_SIZE_K = 256
+        )
 
 @triton.jit
 def softmax_kernel_masklen(
@@ -502,6 +504,7 @@ def transformer_decoder(weights, buffers, encoder_seq_len, num_steps=10):
                 buffers['encoder_V'][i, :encoder_seq_len + seq_len],
                 buffers['decoder_q_buf'],
             )
+            # call matmul_small_res_gate
             matmul_k_2048_1024_gate(
                 buffers['decoder_q_buf'].view(-1, 2048),
                 weights['decoder_attn_o_w'][i],
@@ -524,6 +527,7 @@ def transformer_decoder(weights, buffers, encoder_seq_len, num_steps=10):
                 weights['decoder_ffn_up_w'][i],
                 buffers['decoder_hidden']
             )
+            # call matmul_small_res_gate
             matmul_k_4096_1024_gate(
                 buffers['decoder_hidden'],
                 weights['decoder_ffn_down_w'][i],
