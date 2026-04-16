@@ -693,9 +693,14 @@ def rms_norm_kernel(inp_ptr, out_ptr, seq_len : tl.constexpr, features : tl.cons
     configs=[
         triton.Config({"BLOCK_SIZE_N": 128, "BLOCK_SIZE_M": 64, "BLOCK_SIZE_K": 32}, num_warps=4, num_stages=3),
         triton.Config({"BLOCK_SIZE_N": 128, "BLOCK_SIZE_M": 64, "BLOCK_SIZE_K": 32}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_SIZE_N": 128, "BLOCK_SIZE_M": 64, "BLOCK_SIZE_K": 32}, num_warps=8, num_stages=3),
         triton.Config({"BLOCK_SIZE_N": 128, "BLOCK_SIZE_M": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_SIZE_N": 128, "BLOCK_SIZE_M": 64, "BLOCK_SIZE_K": 64}, num_warps=8, num_stages=3),
         triton.Config({"BLOCK_SIZE_N": 64, "BLOCK_SIZE_M": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=4),
         triton.Config({"BLOCK_SIZE_N": 128, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_K": 32}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_SIZE_N": 128, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_K": 32}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_SIZE_N": 128, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_SIZE_N": 64, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=3),
     ],
     key=["seq_len"],
 )
@@ -818,7 +823,9 @@ def scaled_matmul_small_gate(inp_ptr, inp_norm_factor_ptr, weight1_ptr, weight2_
 def rms_matmul_n_2048_16384_gate_encoder(x, weight1, weight2, out, x_norm):
     seq_len = x.shape[0]
     rms_norm_kernel[(seq_len,)](x, x_norm, seq_len, 2048)
+    # print(f"seq_len: {seq_len}")
     grid = lambda META: (triton.cdiv(seq_len, META["BLOCK_SIZE_N"]), triton.cdiv(16384, META["BLOCK_SIZE_M"]))
+    # with nvtx_range("matmul_small_gate_encoder"):
     matmul_small_gate_encoder_kernel[grid](
         x_norm, weight1, weight2, out,
         seq_len = seq_len,
