@@ -931,17 +931,16 @@ def matmul_n_16384_2048_res(x, weight, out):
     BLOCK_SIZE_N = 128
     if seq_len < 512:
         BLOCK_SIZE_N = 64
-    with nvtx_range("matmul_small_16384_2048_res"):
-        grid = lambda META: (triton.cdiv(seq_len, META["BLOCK_SIZE_N"]), triton.cdiv(2048, META["BLOCK_SIZE_M"]))
-        matmul_small_res_2d_kernel[grid](
-            x,
-            weight,
-            out,
-            out,
-            seq_len = seq_len,
-            features = 16384,
-            hidden = 2048,
-        )
+    grid = lambda META: (triton.cdiv(seq_len, META["BLOCK_SIZE_N"]), triton.cdiv(2048, META["BLOCK_SIZE_M"]))
+    matmul_small_res_2d_kernel[grid](
+        x,
+        weight,
+        out,
+        out,
+        seq_len = seq_len,
+        features = 16384,
+        hidden = 2048,
+    )
 
 def layer_norm_matmul_n256_1152_2048_bias(x, norm_w, norm_b, proj_w, proj_b, out, x_norm):
     seq_len = x.shape[0] * 256
@@ -1018,17 +1017,16 @@ def AttnSingleKey(Q, K, V, scale):
 
 def matmul_n_2048_2048_res(x, weight, out):
     seq_len = x.shape[0]
-    with nvtx_range("matmul_small_2048_2048_res"):
-        grid = lambda META: (triton.cdiv(seq_len, META["BLOCK_SIZE_N"]), triton.cdiv(2048, META["BLOCK_SIZE_M"]))
-        matmul_small_res_2d_kernel[grid](
-            x,
-            weight,
-            out,
-            out,
-            seq_len = seq_len,
-            features = 2048,
-            hidden = 2048,
-        )
+    grid = lambda META: (triton.cdiv(seq_len, META["BLOCK_SIZE_N"]), triton.cdiv(2048, META["BLOCK_SIZE_M"]))
+    matmul_small_res_2d_kernel[grid](
+        x,
+        weight,
+        out,
+        out,
+        seq_len = seq_len,
+        features = 2048,
+        hidden = 2048,
+    )
 
 def transformer_encoder(weights, buffers, encoder_seq_len):
     layer_norm_matmul_n256_1152_2048_bias(
