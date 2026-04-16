@@ -1,8 +1,8 @@
 ncu --target-processes application-only \
     --nvtx \
-    --nvtx-include "matmul_small_gate_decoder]" \
+    --nvtx-include "matmul_small_gate_encoder]" \
     --set full \
     --kernel-name-base demangled \
     --launch-count 20 \
-    -o ncu_pi05_matmul_small_gate_decoder \
+    -o ncu_pi05_matmul_small_gate_encoder_opt2 \
     python benchmark.py --model_version pi05 --num_views 3 --chunk_size 50 --prompt_len 10

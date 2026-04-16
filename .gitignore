@@ -1,1 +1,6 @@
 __pycache__/
+*.txt
+*.ncu-rep
+*.log
+*.sqlite
+*.nsys-rep
