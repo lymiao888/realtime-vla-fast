@@ -1,8 +1,10 @@
 import torch
+import torch.cuda.nvtx as nvtx
 import triton
 import triton.language as tl
 import numpy as np
 import torch.nn as nn
+from contextlib import contextmanager
 from transformers import AutoTokenizer
 from pi0_infer import (
     vision_encoder,
@@ -18,6 +20,30 @@ from pi0_infer import (
     matmul_k8_n_256,
     matmul_abT_scale,
 )
+
+NVTX_ENABLED = True
+
+@contextmanager
+def nvtx_enabled(enabled: bool):
+    global NVTX_ENABLED
+    prev = NVTX_ENABLED
+    NVTX_ENABLED = enabled
+    try:
+        yield
+    finally:
+        NVTX_ENABLED = prev
+
+
+@contextmanager
+def nvtx_range(name: str):
+    if (not NVTX_ENABLED) or (not torch.cuda.is_available()):
+        yield
+        return
+    nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        nvtx.range_pop()
 
 @triton.jit
 def matmul_small_res_gate(inp_ptr, weight_ptr, out_ptr, res_ptr, gate_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden : tl.constexpr,
@@ -492,15 +518,16 @@ def transformer_decoder(weights, buffers, encoder_seq_len, num_steps=10):
                 buffers['decoder_style_ffn'][step, i]
             )
             seq_len = buffers['decoder_x'].shape[0]
-            matmul_small_gate[( (seq_len + 127) // 128, (4096 + 63) // 64 )](
-                buffers['x_normed_buf'],
-                weights['decoder_ffn_gate_w'][i],
-                weights['decoder_ffn_up_w'][i],
-                buffers['decoder_hidden'],
-                seq_len,
-                1024,
-                4096,
-            )
+            with nvtx_range("matmul_small_gate_decoder"):
+                matmul_small_gate[( (seq_len + 127) // 128, (4096 + 63) // 64 )](
+                    buffers['x_normed_buf'],
+                    weights['decoder_ffn_gate_w'][i],
+                    weights['decoder_ffn_up_w'][i],
+                    buffers['decoder_hidden'],
+                    seq_len,
+                    1024,
+                    4096,
+                )
             matmul_k_4096_1024_gate(
                 buffers['decoder_hidden'],
                 weights['decoder_ffn_down_w'][i],
@@ -538,6 +565,7 @@ class Pi05Inference:
         discrete_state_input: bool = True,
         max_prompt_text: str | None = None,
         state_dim_for_max_prompt: int | None = None,
+        use_cuda_graph: bool = False,
     ):
         self.discrete_state_input = discrete_state_input
         self.tokenizer_path = tokenizer_path
@@ -545,6 +573,8 @@ class Pi05Inference:
         self.num_views = num_views
         self.chunk_size = chunk_size
         self.max_tokenize_len = int(max_tokenize_len)
+        # Force-disable CUDA Graph path to keep profiling/execution in eager mode.
+        self.use_cuda_graph = False
         if discrete_state_input:
             self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
             if max_prompt_text is not None and state_dim_for_max_prompt is not None:
@@ -743,8 +773,10 @@ class Pi05Inference:
             self._prompt_embed_scale = float(emb_w_t.shape[1] ** 0.5)
         self.encoder_seq_len = encoder_seq_len
 
-        self.infer_graph = torch.cuda.CUDAGraph()
-        self.record_infer_graph()
+        self.infer_graph = None
+        if self.use_cuda_graph:
+            self.infer_graph = torch.cuda.CUDAGraph()
+            self.record_infer_graph()
 
     def estimate_max_prompt_len(
         self,
@@ -822,5 +854,8 @@ class Pi05Inference:
         self.buffers['decoder_rope_weights'].copy_(self.get_decoder_rope_weights(prompt_len))
         self.buffers['observation_images_normalized'].copy_(observation_images_normalized)
         self.buffers['diffusion_noise'].copy_(diffusion_noise)
-        self.infer_graph.replay()
+        if self.use_cuda_graph:
+            self.infer_graph.replay()
+        else:
+            self.record_run()
         return self.buffers['diffusion_noise']

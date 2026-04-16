@@ -1,27 +1,29 @@
 import time
 import argparse
 import torch
+import pi0_infer
+import pi05_infer
 from pi0_infer import Pi0Inference
 from pi05_infer import Pi05Inference
 
 def benchmark_pi0(args):
     infer = Pi0Inference({
         'language_embeds' : torch.randn(args.prompt_len, 2048, dtype = torch.bfloat16),
-    }, num_views=args.num_views, chunk_size=args.chunk_size)
+    }, num_views=args.num_views, chunk_size=args.chunk_size, use_cuda_graph=False)
 
     input_image = torch.randn(args.num_views, 224, 224, 3, dtype = torch.bfloat16).cuda()
     input_state = torch.randn(32, dtype = torch.bfloat16).cuda()
     input_noise = torch.randn(args.chunk_size, 32, dtype = torch.bfloat16).cuda()
 
     # Warm up
-    for _ in range(3):
-        _ = infer.forward(input_image, input_state, input_noise)
-        torch.cuda.synchronize()
+    with pi0_infer.nvtx_enabled(False):
+        for _ in range(args.warmup_iterations):
+            _ = infer.forward(input_image, input_state, input_noise)
+            torch.cuda.synchronize()
 
     # Benchmark
-    iterations = 100
     times = []
-    for _ in range(iterations):
+    for _ in range(args.iterations):
         t0 = time.time()
         _ = infer.forward(input_image, input_state, input_noise)
         torch.cuda.synchronize()
@@ -34,20 +36,21 @@ def benchmark_pi0(args):
 def benchmark_pi05(args):
     infer = Pi05Inference({
         'language_embeds' : torch.randn(args.prompt_len, 2048, dtype = torch.bfloat16),
-    }, num_views=args.num_views, chunk_size=args.chunk_size, discrete_state_input=False)
+    }, num_views=args.num_views, chunk_size=args.chunk_size, discrete_state_input=False, use_cuda_graph=False)
 
     input_image = torch.randn(args.num_views, 224, 224, 3, dtype=torch.bfloat16, device="cuda")
     input_noise = torch.randn(args.chunk_size, 32, dtype=torch.bfloat16, device="cuda")
 
     # Warm up
-    for _ in range(3):
-        _ = infer.forward(input_image, input_noise)
-        torch.cuda.synchronize()
+    with pi0_infer.nvtx_enabled(False):
+        with pi05_infer.nvtx_enabled(False):
+            for _ in range(args.warmup_iterations):
+                _ = infer.forward(input_image, input_noise)
+                torch.cuda.synchronize()
 
     # Benchmark
-    iterations = 100
     times = []
-    for _ in range(iterations):
+    for _ in range(args.iterations):
         t0 = time.time()
         _ = infer.forward(input_image, input_noise)
         torch.cuda.synchronize()
@@ -64,6 +67,8 @@ def main():
     parser.add_argument("--num_views", type=int, default=3, help="Number of views")
     parser.add_argument("--chunk_size", type=int, default=50, help="Chunk size")
     parser.add_argument("--prompt_len", type=int, default=0, help="Pi0 prompt length")
+    parser.add_argument("--warmup_iterations", type=int, default=3, help="Number of warmup iterations")
+    parser.add_argument("--iterations", type=int, default=100, help="Number of benchmark iterations")
 
     args = parser.parse_args()
 

@@ -1,6 +1,34 @@
 import torch
+import torch.cuda.nvtx as nvtx
 import triton
 import triton.language as tl
+from contextlib import contextmanager
+
+
+NVTX_ENABLED = True
+
+
+@contextmanager
+def nvtx_enabled(enabled: bool):
+    global NVTX_ENABLED
+    prev = NVTX_ENABLED
+    NVTX_ENABLED = enabled
+    try:
+        yield
+    finally:
+        NVTX_ENABLED = prev
+
+
+@contextmanager
+def nvtx_range(name: str):
+    if (not NVTX_ENABLED) or (not torch.cuda.is_available()):
+        yield
+        return
+    nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        nvtx.range_pop()
 
 @triton.jit
 def matmul_small_bias_res(inp_ptr, weight_ptr, out_ptr, bias_ptr, res_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden : tl.constexpr,
@@ -1236,9 +1264,11 @@ def pi0_model(weights, buffers, num_views):
     transformer_decoder(weights, buffers, encoder_seq_len)
 
 class Pi0Inference:
-    def __init__(self, checkpoint, num_views, chunk_size):
+    def __init__(self, checkpoint, num_views, chunk_size, use_cuda_graph: bool = False):
         self.num_views = num_views
         self.chunk_size = chunk_size
+        # Force-disable CUDA Graph path to keep profiling/execution in eager mode.
+        self.use_cuda_graph = False
         encoded_prompt = checkpoint['language_embeds']
         self.prompt_len = len(encoded_prompt)
 
@@ -1337,8 +1367,10 @@ class Pi0Inference:
         for k, v in checkpoint.items():
             self.weights[k].copy_(v)
 
-        self.infer_graph = torch.cuda.CUDAGraph()
-        self.record_infer_graph()
+        self.infer_graph = None
+        if self.use_cuda_graph:
+            self.infer_graph = torch.cuda.CUDAGraph()
+            self.record_infer_graph()
     
     def record_run(self):
         self.buffers['encoder_x'][self.num_views * 256:].copy_(self.weights['language_embeds'])
@@ -1357,5 +1389,8 @@ class Pi0Inference:
         self.buffers['observation_images_normalized'].copy_(observation_images_normalized)
         self.buffers['observation_state_normalized'].copy_(observation_state_normalized)
         self.buffers['diffusion_noise'].copy_(diffusion_noise)
-        self.infer_graph.replay()
+        if self.use_cuda_graph:
+            self.infer_graph.replay()
+        else:
+            self.record_run()
         return self.buffers['diffusion_noise']
