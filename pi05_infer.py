@@ -45,49 +45,77 @@ def nvtx_range(name: str):
     finally:
         nvtx.range_pop()
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE_N": 32, "BLOCK_SIZE_M": 32, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_SIZE_N": 32, "BLOCK_SIZE_M": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_SIZE_N": 32, "BLOCK_SIZE_M": 64, "BLOCK_SIZE_K": 128}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_SIZE_N": 64, "BLOCK_SIZE_M": 32, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_SIZE_N": 64, "BLOCK_SIZE_M": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_SIZE_N": 64, "BLOCK_SIZE_M": 64, "BLOCK_SIZE_K": 128}, num_warps=4, num_stages=3),
+    ],
+    key=["seq_len", "features"],
+)
 @triton.jit
 def matmul_small_res_gate(inp_ptr, weight_ptr, out_ptr, res_ptr, gate_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden : tl.constexpr,
                          BLOCK_SIZE_N : tl.constexpr, BLOCK_SIZE_M : tl.constexpr, BLOCK_SIZE_K : tl.constexpr):
-    pid = tl.program_id(0)
-    psize = tl.num_programs(0)
-    grid_i = tl.cdiv(seq_len, BLOCK_SIZE_N)
-    grid_j = tl.cdiv(hidden, BLOCK_SIZE_M)
-    for p in range(pid, grid_i * grid_j, psize):
-        i = (p // grid_j) * BLOCK_SIZE_N
-        j = (p % grid_j) * BLOCK_SIZE_M
-        
-        acc = tl.load(
-            res_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
-            mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
-            other = 0.0
-        ).to(tl.float32)
-        matmul_acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
-        for k in range(0, features, BLOCK_SIZE_K):
-            x = tl.load(
-                inp_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * features + (k + tl.arange(0, BLOCK_SIZE_K))[None, :],
-                mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((k + tl.arange(0, BLOCK_SIZE_K))[None, :] < features),
-                other = 0.0
-            )
-            w = tl.load(
-                weight_ptr + (k + tl.arange(0, BLOCK_SIZE_K))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
-                mask = ((k + tl.arange(0, BLOCK_SIZE_K))[:, None] < features) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
-                other = 0.0
-            )
-            matmul_acc = tl.dot(x, w, matmul_acc)
-        
-        gate = tl.load(
-            gate_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
-            mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
-            other = 0.0
-        ).to(tl.float32)
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    start_i = pid_m * BLOCK_SIZE_N
+    start_j = pid_n * BLOCK_SIZE_M
 
-        acc += matmul_acc * gate
-        
-        tl.store(
-            out_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
-            acc.to(tl.bfloat16),
-            mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden)
-        )
+    x_block_ptr = tl.make_block_ptr(
+        base=inp_ptr,
+        shape=(seq_len, features),
+        strides=(features, 1),
+        offsets=(start_i, 0),
+        block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_K),
+        order=(1, 0),
+    )
+    w_block_ptr = tl.make_block_ptr(
+        base=weight_ptr,
+        shape=(features, hidden),
+        strides=(hidden, 1),
+        offsets=(0, start_j),
+        block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_M),
+        order=(0, 1),
+    )
+    res_block_ptr = tl.make_block_ptr(
+        base=res_ptr,
+        shape=(seq_len, hidden),
+        strides=(hidden, 1),
+        offsets=(start_i, start_j),
+        block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_M),
+        order=(1, 0),
+    )
+    gate_block_ptr = tl.make_block_ptr(
+        base=gate_ptr,
+        shape=(seq_len, hidden),
+        strides=(hidden, 1),
+        offsets=(start_i, start_j),
+        block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_M),
+        order=(1, 0),
+    )
+
+    acc = tl.load(res_block_ptr, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+    matmul_acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+    for _ in range(0, features, BLOCK_SIZE_K):
+        x = tl.load(x_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        w = tl.load(w_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        matmul_acc = tl.dot(x, w, matmul_acc)
+        x_block_ptr = tl.advance(x_block_ptr, (0, BLOCK_SIZE_K))
+        w_block_ptr = tl.advance(w_block_ptr, (BLOCK_SIZE_K, 0))
+
+    gate = tl.load(gate_block_ptr, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+    acc += matmul_acc * gate
+
+    offs_i = start_i + tl.arange(0, BLOCK_SIZE_N)[:, None]
+    offs_j = start_j + tl.arange(0, BLOCK_SIZE_M)[None, :]
+    tl.store(
+        out_ptr + offs_i * hidden + offs_j,
+        acc.to(tl.bfloat16),
+        mask=((offs_i < seq_len) & (offs_j < hidden))
+    )
 
 def matmul_k_32_1024_bias(x, weight, bias, out):
     seq_len = x.shape[0]
@@ -276,7 +304,8 @@ def adarms_matmul_k_1024_32_bias_res(
 def matmul_k_2048_1024_gate(x, weight, out, gate):
     seq_len = x.shape[0]
     with nvtx_range("matmul_small_res_gate_2048_1024"):
-        matmul_small_res_gate[(128,)](
+        grid = lambda META: (triton.cdiv(seq_len, META["BLOCK_SIZE_N"]), triton.cdiv(1024, META["BLOCK_SIZE_M"]))
+        matmul_small_res_gate[grid](
             x,
             weight,
             out,
@@ -285,15 +314,13 @@ def matmul_k_2048_1024_gate(x, weight, out, gate):
             seq_len = seq_len,
             features = 2048,
             hidden = 1024,
-            BLOCK_SIZE_N = 32,
-            BLOCK_SIZE_M = 32,
-            BLOCK_SIZE_K = 128
         )
 
 def matmul_k_4096_1024_gate(x, weight, out, gate):
     seq_len = x.shape[0]
     with nvtx_range("matmul_small_res_gate_4096_1024"):
-        matmul_small_res_gate[(((seq_len + 15) // 16) * (1024 // 32),)](
+        grid = lambda META: (triton.cdiv(seq_len, META["BLOCK_SIZE_N"]), triton.cdiv(1024, META["BLOCK_SIZE_M"]))
+        matmul_small_res_gate[grid](
             x,
             weight,
             out,
@@ -302,9 +329,6 @@ def matmul_k_4096_1024_gate(x, weight, out, gate):
             seq_len = seq_len,
             features = 4096,
             hidden = 1024,
-            BLOCK_SIZE_N = 16,
-            BLOCK_SIZE_M = 32,
-            BLOCK_SIZE_K = 256
         )
 
 @triton.jit
