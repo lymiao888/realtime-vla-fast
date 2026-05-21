@@ -1,0 +1,49 @@
+import time
+import argparse
+import torch
+
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from models.pi05_model import Pi05Inference
+
+
+def benchmark_pi05(args):
+    infer = Pi05Inference({
+        'language_embeds': torch.randn(args.prompt_len, 2048, dtype=torch.bfloat16),
+    }, num_views=args.num_views, chunk_size=args.chunk_size, discrete_state_input=False)
+
+    input_image = torch.randn(args.num_views, 224, 224, 3, dtype=torch.bfloat16, device="cuda")
+    input_noise = torch.randn(args.chunk_size, 32, dtype=torch.bfloat16, device="cuda")
+
+    # Warm up
+    for _ in range(3):
+        _ = infer.forward(input_image, input_noise)
+        torch.cuda.synchronize()
+
+    # Benchmark
+    iterations = 100
+    times = []
+    for _ in range(iterations):
+        t0 = time.time()
+        _ = infer.forward(input_image, input_noise)
+        torch.cuda.synchronize()
+        t1 = time.time()
+        times.append(t1 - t0)
+
+    print('[Pi05 Triton]:', 'views', args.num_views, 'chunk_size', args.chunk_size)
+    print('runs', len(times), 'median time per inference:', '%.3f' % (sorted(times)[len(times)//2]*1000), 'ms')
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num_views", type=int, default=3, help="Number of views")
+    parser.add_argument("--chunk_size", type=int, default=50, help="Chunk size")
+    parser.add_argument("--prompt_len", type=int, default=20, help="Pi05 prompt length (for language_embeds)")
+    args = parser.parse_args()
+
+    benchmark_pi05(args)
+
+
+if __name__ == "__main__":
+    main()
